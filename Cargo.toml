@@ -1,0 +1,17 @@
+[package]
+name = "tide-session"
+version = "0.1.0"
+authors = ["Tom Houlé <tom@tomhoule.com>"]
+edition = "2018"
+
+[dependencies]
+tide = { git = "https://github.com/rust-net-web/tide" }
+futures-preview = "0.3.0-alpha.13"
+http-service = "0.1.4"
+http = "0.1.16"
+regex = "1.1.2"
+uuid = { version = "0.7.2", features = ["v4"] }
+failure = "0.1.5"
+http-service-mock = "0.1.0"
+log = "0.4.6"
+pretty_env_logger = "0.3.0"
