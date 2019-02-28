@@ -5,19 +5,20 @@
 #![feature(await_macro)]
 #![feature(futures_api)]
 
-use log::error;
 use futures::future::{FutureExt, FutureObj};
+use futures::lock::Mutex;
+use log::error;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tide::IntoResponse;
 use tide::{Extract, Request, Response, RouteMatch};
 
-pub struct InMemorySession<S>(RwLock<HashMap<String, S>>);
+pub struct InMemorySession<S>(Mutex<HashMap<String, S>>);
 pub struct RedisSession;
 
 impl<S> InMemorySession<S> {
     pub fn new() -> Self {
-        InMemorySession(RwLock::new(HashMap::new()))
+        InMemorySession(Mutex::new(HashMap::new()))
     }
 }
 
@@ -28,21 +29,24 @@ where
     type Value = S;
 
     fn get(&self, key: &str) -> FutureObj<Result<Option<Self::Value>, failure::Error>> {
-        let guard = self.0.read().expect("lock is poisoned");
-        let result = guard.get(key).cloned();
-        FutureObj::new(futures::future::ok(result).boxed())
+        let key = key.to_owned();
+        FutureObj::new(self.0.lock().map(move |guard| Ok(guard.get(&key).cloned())).boxed())
     }
 
     fn set(&self, key: &str, value: Self::Value) -> FutureObj<Result<(), failure::Error>> {
-        let mut guard = self.0.write().expect("mutex is poisoned");
-        guard.insert(key.to_owned(), value);
-        FutureObj::new(futures::future::ok(()).boxed())
+        let key = key.to_owned();
+        FutureObj::new(self.0.lock().map(move |mut guard| {
+            guard.insert(key, value);
+            Ok(())
+        }).boxed())
     }
 
     fn delete(&self, key: &str) -> FutureObj<Result<(), failure::Error>> {
-        let mut guard = self.0.write().expect("mutex is poisoned");
-        guard.remove(key);
-        FutureObj::new(futures::future::ok(()).boxed())
+        let key = key.to_owned();
+        FutureObj::new(self.0.lock().map(move |mut guard| {
+            guard.remove(&key);
+            Ok(())
+        }).boxed())
     }
 }
 
