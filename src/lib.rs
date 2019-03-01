@@ -5,61 +5,21 @@
 #![feature(await_macro)]
 #![feature(futures_api)]
 
+pub mod storage;
+
+use storage::*;
+
 use futures::future::{FutureExt, FutureObj};
-use futures::lock::Mutex;
 use log::error;
-use std::collections::HashMap;
 use std::sync::Arc;
+use storage::*;
 use tide::IntoResponse;
 use tide::{Extract, Request, Response, RouteMatch};
 
-pub struct InMemorySession<S>(Mutex<HashMap<String, S>>);
-pub struct RedisSession;
-
-impl<S> InMemorySession<S> {
-    pub fn new() -> Self {
-        InMemorySession(Mutex::new(HashMap::new()))
-    }
-}
-
-impl<S> SessionStorage for InMemorySession<S>
-where
-    S: Clone + Send,
-{
-    type Value = S;
-
-    fn get(&self, key: &str) -> FutureObj<Result<Option<Self::Value>, failure::Error>> {
-        let key = key.to_owned();
-        FutureObj::new(self.0.lock().map(move |guard| Ok(guard.get(&key).cloned())).boxed())
-    }
-
-    fn set(&self, key: &str, value: Self::Value) -> FutureObj<Result<(), failure::Error>> {
-        let key = key.to_owned();
-        FutureObj::new(self.0.lock().map(move |mut guard| {
-            guard.insert(key, value);
-            Ok(())
-        }).boxed())
-    }
-
-    fn delete(&self, key: &str) -> FutureObj<Result<(), failure::Error>> {
-        let key = key.to_owned();
-        FutureObj::new(self.0.lock().map(move |mut guard| {
-            guard.remove(&key);
-            Ok(())
-        }).boxed())
-    }
-}
-
-pub trait SessionStorage {
-    type Value;
-
-    fn get(&self, key: &str) -> FutureObj<Result<Option<Self::Value>, failure::Error>>;
-
-    fn set(&self, key: &str, value: Self::Value) -> FutureObj<Result<(), failure::Error>>;
-
-    fn delete(&self, key: &str) -> FutureObj<Result<(), failure::Error>>;
-}
-
+/// The extractable handle to a session. Users can read, set and delete the session data from this.
+///
+/// `SessionShape` is the user-defined contents of the session. It has to be `Clone` and gets
+/// copied often, so it is preferrable not to store large amounts of data in the session.
 pub struct Session<SessionShape>(Handle<SessionShape>);
 
 impl<SessionShape> Session<SessionShape> {
@@ -79,8 +39,8 @@ impl<SessionShape> Session<SessionShape> {
         await! { self.0.storage.delete(&self.0.session_id) }
     }
 
-    // see rails security reset
-    // implemented with a oneshot channel
+    // see rails security guide, reset_session
+    // could be implemented with a channel signaling the reset to the middleware
     // pub fn reset(&self) {
     //   self.0.
     // }
@@ -112,26 +72,33 @@ where
 
 type SessionId = String;
 
+// What the middleware puts in request context.
 #[derive(Clone)]
 struct Handle<SessionShape> {
     session_id: SessionId,
     storage: Storage<SessionShape>,
 }
 
-// store key and strategy out must match
+type Storage<SessionShape> = Arc<dyn SessionStorage<Value = SessionShape> + Send + Sync>;
+
+/// The session middleware.
+///
+/// The `SessionShape` parameter is the user-defined shape of the sessions managed by the
+/// middleware.
 pub struct CookieSessionMiddleware<SessionShape> {
+    /// The name of the cookie used to store the session id.
     cookie_name: String,
-    /// Used for extracting the cookie
+    /// Used for extracting the cookie. We do not use the Cookies extractor from tide (yet) because
+    /// composing extractors and middlewares is difficult.
     cookie_matcher: regex::Regex,
     storage: Storage<SessionShape>,
 }
-
-type Storage<SessionShape> = Arc<dyn SessionStorage<Value = SessionShape> + Send + Sync>;
 
 impl<SessionShape> CookieSessionMiddleware<SessionShape>
 where
     SessionShape: Send + Sync + 'static + Clone,
 {
+    /// `cookie_name` will be the name of the cookie used to store the session id.
     pub fn new(cookie_name: String, storage: Storage<SessionShape>) -> Result<Self, regex::Error> {
         let cookie_matcher = regex::Regex::new(&format!(r"{}=([a-z0-9-]+)", cookie_name))?;
         Ok(CookieSessionMiddleware {
@@ -141,6 +108,7 @@ where
         })
     }
 
+    /// Attempt to read the session id from the cookies on a request.
     fn extract_session_id(&self, req: &Request) -> Option<String> {
         let cookies = req.headers().get(http::header::COOKIE);
         cookies
@@ -202,6 +170,7 @@ where
     }
 }
 
+/// Generate a new session id.
 fn new_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
