@@ -5,7 +5,7 @@ authors = ["Tom Houlé <tom@tomhoule.com>"]
 edition = "2018"
 
 [dependencies]
-tide = { git = "https://github.com/rust-net-web/tide" }
+tide = { path = "../tide-aturon" }
 futures-preview = "0.3.0-alpha.13"
 http-service = "0.1.4"
 http = "0.1.16"

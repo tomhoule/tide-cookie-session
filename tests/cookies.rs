@@ -4,9 +4,9 @@
 
 use http_service::Body;
 use http_service_mock::{make_server, TestBackend};
-use std::sync::Arc;
 use tide::Response;
 use tide_session::*;
+use tide_session::storage::*;
 
 #[derive(Clone, Debug)]
 enum UserCategory {
@@ -19,26 +19,24 @@ struct AppSession {
     user_category: UserCategory,
 }
 
-async fn logout(session: Session<AppSession>) -> Response {
-    let res = await! { session.delete() };
-    res.unwrap();
+async fn logout(mut ctx: tide::Context<()>) -> Response {
+    ctx.set_session::<Option<AppSession>>(None);
     Response::new(Body::empty())
 }
 
-async fn authenticate_user(session: Session<AppSession>) -> Response {
+async fn authenticate_user(mut ctx: tide::Context<()>) -> Response {
     let res = Response::new(Body::empty());
 
-    let result = await! { session.set(AppSession {
+    ctx.set_session(Some(AppSession {
         user_id: "george".into(),
         user_category: UserCategory::Admin,
-    }) };
-    result.unwrap();
+    }));
 
     res
 }
 
-async fn print_session(session: Session<AppSession>) -> Response {
-    let session: Option<AppSession> = await! { session.get() }.unwrap();
+async fn print_session(mut ctx: tide::Context<()>) -> Response {
+    let session: Option<AppSession> = ctx.take_session();
     let printed_session = format!("{:?}", session);
     let res = Response::new(printed_session.into());
     res
@@ -47,7 +45,8 @@ async fn print_session(session: Session<AppSession>) -> Response {
 struct WrongSession { _something: String }
 
 // It is going to fail because the middleware does not provide this shape of sessions.
-async fn bad_endpoint(_session: Session<WrongSession>) -> Response {
+async fn bad_endpoint(mut ctx: tide::Context<()>) -> Response {
+    let _session: Option<WrongSession> = ctx.take_session();
     Response::new(Body::empty())
 }
 
@@ -62,7 +61,7 @@ fn app() -> TestBackend<tide::Server<()>> {
     app.middleware(
         CookieSessionMiddleware::new(
             "test_app".into(),
-            Arc::new(InMemorySession::<AppSession>::new()),
+            InMemorySession::<Option<AppSession>>::new(),
         )
         .unwrap(),
     );
@@ -160,5 +159,5 @@ fn extractor_with_bad_session_shape_does_not_crash() {
 
     let res = app.simulate(req).unwrap();
 
-    assert_eq!(res.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(res.status(), http::StatusCode::OK);
 }
