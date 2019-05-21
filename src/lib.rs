@@ -2,43 +2,47 @@
 
 #![feature(associated_type_defaults)]
 #![feature(async_await)]
-#![feature(await_macro)]
 #![feature(futures_api)]
 
 pub mod storage;
 
 use storage::*;
-
+use tide_core::{error::StringError, Context, box_async};
 use futures::channel::oneshot;
-use futures::future::{FutureExt, FutureObj};
+use futures::future::BoxFuture;
+use tide_cookies::ContextExt as _;
+use cookie::{Cookie,SameSite};
+const MIDDLEWARE_MISSING_MSG: &str =
+    "SessionMiddleware must be used to populate request and response cookies";
 
-pub trait WithSession {
-    fn set_session<T: 'static + Sync + Send + Default>(&mut self, new_session: T);
-    fn take_session<T: 'static + Sync + Send + Default>(&mut self) -> T;
+pub trait ContextExt {
+    fn set_session<T: 'static + Sync + Send + Default>(&mut self, new_session: T) -> Result<(), StringError>;
+    fn take_session<T: 'static + Sync + Send + Default>(&mut self) -> Result<T, StringError>;
 
     // see rails security guide, reset_session
     // could be implemented with a channel signaling the reset to the middleware
     // fn reset(&self);
 }
 
-impl<AppData> WithSession for tide::Context<AppData> {
-    fn set_session<T: 'static + Sync + Send + Default>(&mut self, new_session: T) {
-        match self.remove_extension::<Session<T>>() {
-            Some(session) => {
-                session
-                    .sender
-                    .send(new_session)
-                    .map_err(|_| ())
-                    .expect("TODO: error handling");
-            }
-            None => (),
-        }
+impl<AppData> ContextExt for tide::Context<AppData> {
+    fn set_session<T: 'static + Sync + Send + Default>(&mut self, new_session: T) -> Result<(), StringError> {
+       let session = self
+           .extensions_mut()
+           .remove::<Session<T>>()
+           .ok_or_else(|| StringError(MIDDLEWARE_MISSING_MSG.to_owned()))?;
+       session
+           .sender
+           .send(new_session)
+           .map_err(|_| StringError("Unable to handle session".to_owned()))
     }
 
-    fn take_session<T: 'static + Sync + Send + Default>(&mut self) -> T {
-        self.remove_extension::<Session<T>>()
+    fn take_session<T: 'static + Sync + Send + Default>(&mut self) -> Result<T, StringError> {
+        let session = self
+            .extensions_mut()
+            .remove::<Session<T>>()
+            .ok_or_else(|| StringError(MIDDLEWARE_MISSING_MSG.to_owned()));
+        session
             .map(|s| s.data)
-            .unwrap_or_else(Default::default)
     }
 }
 
@@ -62,10 +66,10 @@ where
 type SessionId = String;
 
 /// The cookie session middleware.
-pub struct CookieSessionMiddleware<Store> {
+pub struct CookieSessionMiddleware<Storage> {
     /// The name of the cookie used to store the session id.
     cookie_name: String,
-    storage: Store,
+    storage: Storage,
 }
 
 /// The `Shape` parameter is the user-defined shape of the sessions managed by the
@@ -73,76 +77,65 @@ pub struct CookieSessionMiddleware<Store> {
 impl<Storage, Shape> CookieSessionMiddleware<Storage>
 where
     Storage: SessionStorage<Value = Shape>,
-    Shape: Send + Sync + 'static + Clone + Default,
+    //Shape: Send + Sync + 'static + Clone + Default,
+    Shape: 'static,
 {
     /// `cookie_name` will be the name of the cookie used to store the session id.
-    pub fn new(cookie_name: String, storage: Storage) -> Result<Self, regex::Error> {
-        Ok(CookieSessionMiddleware {
+    pub fn new(cookie_name: String, storage: Storage) -> Self {
+        CookieSessionMiddleware {
             cookie_name,
             storage,
-        })
+        }
     }
 
     /// Attempt to read the session id from the cookies on a request.
     fn extract_session_id<A>(&self, ctx: &mut tide::Context<A>) -> Option<String> {
-        use tide::cookies::Cookies as _;
-
-        ctx.cookie(&self.cookie_name).map(|c| c.value().to_owned())
+        ctx.get_cookie(&self.cookie_name).expect("can't read cookies").map(|c| c.value().to_owned())
     }
 
-    async fn middleware_impl<'a, AppData>(
-        &'a self,
-        mut ctx: tide::Context<AppData>,
-        next: tide::middleware::Next<'a, AppData>,
-    ) -> tide::Response
-    where
-        AppData: Send + 'static + Clone,
-    {
-        let session_id = self
-            .extract_session_id(&mut ctx)
-            .unwrap_or_else(new_session_id);
-
-        let set_cookie_header =
-            http::header::HeaderValue::from_str(&format!("{}={}", &self.cookie_name, &session_id))
-                .expect("TODO: error handling");
-
-        let session_shape = await!(self.storage.get(&session_id))
-            .ok()
-            .and_then(|a| a)
-            .unwrap_or_default();
-
-        let (session, mut receiver) = Session::new(session_shape);
-
-        ctx.insert_extension::<Session<Shape>>(session);
-
-        let mut res = await! { next.run(ctx) };
-
-        let received = receiver.try_recv().ok().and_then(|a| a);
-
-        if let Some(received) = received {
-            await!(self.storage.set(&session_id, received)).expect("TODO: error handling");
-        }
-
-        res.headers_mut().insert("Set-Cookie", set_cookie_header);
-
-        res
-    }
 }
 
 impl<AppData, Storage, Shape> tide::middleware::Middleware<AppData>
     for CookieSessionMiddleware<Storage>
 where
-    AppData: Clone + Sync + Send + 'static,
+    AppData: Send + Sync + 'static,
     Storage: SessionStorage<Value = Shape> + Sync + Send + 'static,
     Shape: Clone + Send + Sync + 'static + Default,
 {
     fn handle<'a>(
         &'a self,
-        ctx: tide::Context<AppData>,
+        mut ctx: tide::Context<AppData>,
         next: tide::middleware::Next<'a, AppData>,
-    ) -> FutureObj<'a, tide::Response> {
-        let fut = self.middleware_impl(ctx, next).boxed();
-        FutureObj::new(fut)
+    ) -> BoxFuture<'a, tide::Response> {
+        box_async! {
+            let session_id = self
+                .extract_session_id(&mut ctx)
+                .unwrap_or_else(new_session_id);
+
+            let session_shape = self.storage.get(&session_id).await
+                .ok()
+                .and_then(|a| a)
+                .unwrap_or_default();
+
+            let (session, mut receiver) = Session::new(session_shape);
+            ctx.extensions_mut().insert::<Session<Shape>>(session);
+
+            let mut session_cookie = Cookie::new(self.cookie_name.clone(), session_id.clone());
+            session_cookie.set_path("/");
+            session_cookie.set_http_only(true);
+            session_cookie.set_same_site(SameSite::Strict);
+            ctx.set_cookie(session_cookie);
+
+            let res = next.run(ctx).await;
+
+            let received = receiver.try_recv().ok().and_then(|a| a);
+
+            if let Some(received) = received {
+                self.storage.set(&session_id, received).await.expect("TODO: error handling");
+            }
+
+            res
+        }
     }
 }
 

@@ -7,6 +7,13 @@ store (implementing the `SessionStorage` trait)
 
 ## Examples
 
+### Setting the middleware
+
+```rust
+    let state: InMemorySession<()> = InMemorySession::new();
+    app.middleware(CookieSessionMiddleware::new("MySession".to_string(), state));
+```
+
 ### Reading the contents of the session
 
 ```rust
