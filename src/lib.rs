@@ -6,17 +6,20 @@
 
 pub mod storage;
 
-use storage::*;
-use tide_core::{error::StringError, Context, box_async};
+use cookie::{Cookie, SameSite};
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
+use storage::*;
 use tide_cookies::ContextExt as _;
-use cookie::{Cookie,SameSite};
+use tide_core::{box_async, error::StringError, Context};
 const MIDDLEWARE_MISSING_MSG: &str =
     "SessionMiddleware must be used to populate request and response cookies";
 
 pub trait ContextExt {
-    fn set_session<T: 'static + Sync + Send + Default>(&mut self, new_session: T) -> Result<(), StringError>;
+    fn set_session<T: 'static + Sync + Send + Default>(
+        &mut self,
+        new_session: T,
+    ) -> Result<(), StringError>;
     fn take_session<T: 'static + Sync + Send + Default>(&mut self) -> Result<T, StringError>;
 
     // see rails security guide, reset_session
@@ -25,15 +28,21 @@ pub trait ContextExt {
 }
 
 impl<AppData> ContextExt for tide::Context<AppData> {
-    fn set_session<T: 'static + Sync + Send + Default>(&mut self, new_session: T) -> Result<(), StringError> {
-       let session = self
-           .extensions_mut()
-           .remove::<Session<T>>()
-           .ok_or_else(|| StringError(MIDDLEWARE_MISSING_MSG.to_owned()))?;
-       session
-           .sender
-           .send(new_session)
-           .map_err(|_| StringError("Unable to handle session".to_owned()))
+    fn set_session<T: 'static + Sync + Send + Default>(
+        &mut self,
+        new_session: T,
+    ) -> Result<(), StringError> {
+        // Handle old session if hasn't been taken
+        let session = self.extensions_mut().remove::<Session<T>>();
+
+        let sender = self
+            .extensions_mut()
+            .remove::<SessionNotifier<T>>()
+            .ok_or_else(|| StringError(MIDDLEWARE_MISSING_MSG.to_owned()))?;
+        sender
+            .notifier
+            .send(new_session)
+            .map_err(|_| StringError("Unable to handle session".to_owned()))
     }
 
     fn take_session<T: 'static + Sync + Send + Default>(&mut self) -> Result<T, StringError> {
@@ -41,25 +50,37 @@ impl<AppData> ContextExt for tide::Context<AppData> {
             .extensions_mut()
             .remove::<Session<T>>()
             .ok_or_else(|| StringError(MIDDLEWARE_MISSING_MSG.to_owned()));
-        session
-            .map(|s| s.data)
+        session.map(|s| s.data)
     }
+}
+
+pub struct SessionNotifier<Shape> {
+    notifier: oneshot::Sender<Shape>,
 }
 
 /// `SessionShape` is the user-defined contents of the session. It has to be `Clone` and gets
 /// copied often, so it is preferrable not to store large amounts of data in the session.
 pub struct Session<Shape> {
     data: Shape,
-    sender: oneshot::Sender<Shape>,
 }
 
 impl<SessionShape> Session<SessionShape>
 where
     SessionShape: Default,
 {
-    fn new(data: SessionShape) -> (Self, oneshot::Receiver<SessionShape>) {
+    fn new(
+        data: SessionShape,
+    ) -> (
+        Self,
+        SessionNotifier<SessionShape>,
+        oneshot::Receiver<SessionShape>,
+    ) {
         let (sender, receiver) = oneshot::channel();
-        (Session { data, sender }, receiver)
+        (
+            Session { data },
+            SessionNotifier { notifier: sender },
+            receiver,
+        )
     }
 }
 
@@ -90,9 +111,10 @@ where
 
     /// Attempt to read the session id from the cookies on a request.
     fn extract_session_id<A>(&self, ctx: &mut tide::Context<A>) -> Option<String> {
-        ctx.get_cookie(&self.cookie_name).expect("can't read cookies").map(|c| c.value().to_owned())
+        ctx.get_cookie(&self.cookie_name)
+            .expect("can't read cookies")
+            .map(|c| c.value().to_owned())
     }
-
 }
 
 impl<AppData, Storage, Shape> tide::middleware::Middleware<AppData>
@@ -117,8 +139,9 @@ where
                 .and_then(|a| a)
                 .unwrap_or_default();
 
-            let (session, mut receiver) = Session::new(session_shape);
+            let (session, sender, mut receiver) = Session::new(session_shape);
             ctx.extensions_mut().insert::<Session<Shape>>(session);
+            ctx.extensions_mut().insert::<SessionNotifier<Shape>>(sender);
 
             let mut session_cookie = Cookie::new(self.cookie_name.clone(), session_id.clone());
             session_cookie.set_path("/");

@@ -5,8 +5,8 @@
 use http_service::Body;
 use http_service_mock::{make_server, TestBackend};
 use tide::Response;
-use tide_session::*;
 use tide_session::storage::*;
+use tide_session::*;
 
 #[derive(Clone, Debug)]
 enum UserCategory {
@@ -42,7 +42,9 @@ async fn print_session(mut ctx: tide::Context<()>) -> Response {
     res
 }
 
-struct WrongSession { _something: String }
+struct WrongSession {
+    _something: String,
+}
 
 // It is going to fail because the middleware does not provide this shape of sessions.
 async fn bad_endpoint(mut ctx: tide::Context<()>) -> Response {
@@ -155,7 +157,10 @@ fn extractor_with_bad_session_shape_does_not_crash() {
 
     pretty_env_logger::init();
 
-    let req = http::Request::builder().uri("/bad-endpoint").body(Body::empty()).unwrap();
+    let req = http::Request::builder()
+        .uri("/bad-endpoint")
+        .body(Body::empty())
+        .unwrap();
 
     let res = app.simulate(req).unwrap();
 
